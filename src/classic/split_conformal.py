@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 # helpers 
 
+# x should be logits
 def score(x, y):
     probs = F.softmax(x, dim=1)
     true_probs = probs[torch.arange(len(y)), y]
@@ -67,7 +68,6 @@ def main():
         print(f"epoch: {epoch + 1}")
         print(f"train loss: {train_loss}")
         print(f"test loss: {test_loss}")
-
     alphas = [0.01, 0.05, 0.10, 0.20, 0.30, 0.50]
 
     for alpha in alphas:
@@ -77,25 +77,62 @@ def main():
         print("qhat:", qhat.item())
 
         covered = 0
+        total = 0
         set_sizes = []
+        examples_by_size = []
 
         for inputs, targets in testloader:
             inputs, targets = inputs.to(device), targets.to(device)
 
             csets = make_sets(model, inputs, qhat)
 
-            for cset, target in zip(csets, targets):
+            logits = model(inputs)
+            probs = F.softmax(logits, dim=1)
+
+            for i, (cset, target) in enumerate(zip(csets, targets)):
                 target = target.item()
 
                 if target in cset:
                     covered += 1
 
-                set_sizes.append(len(cset))
-                
+                examples_by_size.append({
+                    "set_size": len(cset),
+                    "true_label": target,
+                    "pred_label": probs[i].argmax().item(),
+                    "top_prob": probs[i].max().item(),
+                    "cset": cset,
+                    "image": inputs[i].detach().cpu(),
+                })
 
-        empirical_coverage = covered / 10000
+                set_sizes.append(len(cset))
+                total += 1
+
+        empirical_coverage = covered / total
         avg_set_size = sum(set_sizes) / len(set_sizes)
         size_dist = torch.bincount(torch.tensor(set_sizes), minlength=11)
+
+        largest = sorted(examples_by_size, key=lambda d: d["set_size"], reverse=True)[:10]
+        smallest = sorted(examples_by_size, key=lambda d: d["set_size"])[:10]
+
+        print("largest examples:")
+        for ex in largest:
+            print({
+                "set_size": ex["set_size"],
+                "true_label": ex["true_label"],
+                "pred_label": ex["pred_label"],
+                "top_prob": ex["top_prob"],
+                "cset": ex["cset"],
+            })
+
+        print("smallest examples:")
+        for ex in smallest:
+            print({
+                "set_size": ex["set_size"],
+                "true_label": ex["true_label"],
+                "pred_label": ex["pred_label"],
+                "top_prob": ex["top_prob"],
+                "cset": ex["cset"],
+            })
 
         print(f"empirical coverage: {empirical_coverage:.4f}")
         print(f"average set size: {avg_set_size:.4f}")
