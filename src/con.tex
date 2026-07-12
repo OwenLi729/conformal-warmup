@@ -1,0 +1,370 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue,
+  citecolor=black
+}
+
+\title{\textbf{Research Warm-Up Project}\\[0.4em]
+\large Adaptive Coverage Policies in Conformal Prediction}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\bigskip
+
+\section{Overview}
+
+The goal of this project is to provide hands-on exposure to modern conformal
+prediction methods and to develop the skills needed to read, reproduce, and
+extend recent machine learning research.
+
+The project is centered around the paper
+
+\begin{quote}
+  Gauthier, Bach, and Jordan,
+  \emph{Adaptive Coverage Policies in Conformal Prediction},
+  AISTATS 2026. \texttt{arXiv:2510.04318}
+\end{quote}
+
+\noindent By the end of this project, you should be able to:
+
+\begin{itemize}
+  \item Implement split conformal prediction from scratch.
+  \item Understand prediction sets and marginal coverage guarantees.
+  \item Understand the role of e-values in enabling post-hoc valid inference.
+  \item Reproduce the methodology proposed in the ACP paper.
+  \item Reproduce at least one experimental result from the paper.
+  \item Conduct a small extension study.
+  \item Communicate results in the form of a short research report.
+\end{itemize}
+
+Throughout the project, maintain a Git repository containing all code,
+experiments, and figures. Every figure appearing in your report should be
+reproducible from the repository.
+
+% -----------------------------------------------------------------------
+\section{Part 1: Classical Conformal Prediction}
+% -----------------------------------------------------------------------
+
+\subsection{Dataset and Model}
+
+Use the CIFAR-10 dataset, which is the dataset used in the ACP paper for
+classification. Train an image classifier on the full CIFAR-10 training set
+and treat it as a black-box predictor throughout the project. Use the same
+train/calibration/test split throughout.
+
+\subsection{Split Conformal Prediction}
+
+Implement split conformal prediction from scratch.
+
+Let $\hat p_y(x)$ denote the predicted probability (softmax output) assigned
+to class $y$. Use the softmax conformity score
+\[
+  S(x,y) \;=\; 1 - \hat p_y(x).
+\]
+Note that this score is non-negative and \emph{negatively oriented}: lower
+scores indicate better predictions. This property will matter when we later
+switch to e-value-based prediction sets, which require exactly these two
+conditions.
+
+Construct conformal prediction sets at a fixed miscoverage level $\alpha$
+using the standard empirical-quantile threshold: include all labels $y$
+whose score does not exceed the $\lceil(1-\alpha)(n+1)\rceil/n$ empirical
+quantile of the $n$ calibration scores.
+
+You may use existing libraries for training the classifier, but the conformal
+prediction procedure itself should be implemented by you.
+
+\subsection{Experiments}
+
+Evaluate:
+\begin{itemize}
+  \item Empirical coverage.
+  \item Average prediction set size.
+  \item Distribution of prediction set sizes.
+\end{itemize}
+Repeat for several values of $\alpha$.
+
+\subsection{Questions}
+
+\begin{enumerate}[label=\arabic*.]
+  \item How does prediction set size vary with $\alpha$?
+  \item Which examples tend to receive the largest prediction sets?
+  \item Which examples tend to receive the smallest prediction sets?
+  \item What practical limitations does a fixed, global $\alpha$ create?
+\end{enumerate}
+
+% -----------------------------------------------------------------------
+\section{Part 2: Understanding the ACP Paper}
+% -----------------------------------------------------------------------
+
+Read the paper carefully before implementing any part of the method. Your
+goal is not merely to reproduce code, but to understand the main ideas.
+Prepare written answers to the following questions.
+
+\subsection{Reading Questions}
+
+\begin{enumerate}[label=\arabic*.]
+
+\item What problem is ACP attempting to solve, and why does a globally fixed
+$\alpha$ lead to suboptimal or uninformative predictions?
+
+\item What is an e-variable? Write out the definition. What is the
+\emph{soft-rank e-variable} used in the paper, and how does it differ from
+the rank-based comparison used in classical conformal prediction?
+
+\item How is the conformal e-prediction set (eq.~4 in the paper) constructed
+from the soft-rank e-variable? How does this differ from the
+quantile-threshold construction you implemented in Part~1?
+
+\item State the post-hoc validity guarantee (Proposition~2.2) precisely.
+How does it differ from the standard marginal coverage guarantee
+$\mathbb{P}(Y_{\mathrm{test}} \in \hat C_n^\alpha(X_{\mathrm{test}})) \ge
+1-\alpha$?
+
+\item Why does post-hoc validity allow the miscoverage level $\tilde\alpha$
+to be chosen in a data-dependent manner, whereas classical conformal
+prediction does not permit this?
+
+\item What is a coverage policy, and how does the paper formally define it?
+What inputs does it take, and why does the formal definition reduce to the
+\emph{sum} of calibration scores rather than the full vector?
+
+\item The coverage policy is trained using a leave-one-out (LOO) procedure
+on the calibration set. What is the purpose of the LOO procedure here?
+(\emph{Hint}: it is not primarily about avoiding overfitting or reusing data
+efficiently, but about constructing training data.)
+
+\item What is the training objective $\mathcal{L}_\lambda(\theta)$ (eq.~9)?
+Describe each of its two terms and what each encourages the policy to do.
+What is the role of the regularization parameter $\lambda$, and how does the
+paper recommend choosing it?
+
+\item The paper uses the \emph{cross-entropy} as the conformity score in its
+classification experiments:
+$S(x, y) = -\log \hat p_y(x)$.
+What two properties of a score function are required for the soft-rank
+e-variable to be a valid e-value? Verify that the cross-entropy score
+satisfies them.
+
+\item What assumptions are required for the post-hoc validity guarantee?
+
+\end{enumerate}
+
+% -----------------------------------------------------------------------
+\section{Part 3: Implementing Adaptive Coverage Policies}
+% -----------------------------------------------------------------------
+
+Implement the ACP methodology described in the paper. The implementation
+should include:
+
+\begin{itemize}
+
+  \item The \textbf{conformity score}. Use the cross-entropy score
+  $S(x,y) = -\log \hat p_y(x)$ used in the paper (not the softmax score
+  from Part~1).
+
+  \item The \textbf{soft-rank e-variable} and the corresponding
+  \textbf{conformal e-prediction set} (eqs.~2 and~4 in the paper). This is
+  the core prediction-set construction; it replaces the quantile-based
+  construction used in Part~1.
+
+  \item The \textbf{leave-one-out procedure} for generating pseudo
+  calibration--test pairs from the calibration set.
+
+  \item A \textbf{neural network coverage policy} $\tilde\alpha_\theta$
+  trained by minimizing the objective $\mathcal{L}_\lambda(\theta)$, using
+  the smooth sigmoid surrogate for the non-differentiable set-size term
+  (eq.~5 in the paper).
+
+  \item A \textbf{procedure for selecting $\lambda$} to target a desired
+  expected prediction set size at test time (Algorithm~2).
+
+  \item \textbf{Test-time inference}: computing $\tilde\alpha_\theta^{\mathrm{test}}$
+  and constructing the corresponding prediction set.
+
+\end{itemize}
+
+Do not consult the authors' implementation until after you have completed
+your own. Document any decisions not fully specified in the paper (e.g.\
+network architecture, sharpness parameter $k$, optimizer and learning rate).
+
+\subsection{Verification}
+
+Before running full experiments, verify that:
+\begin{itemize}
+  \item The trained policy produces non-trivial variation in miscoverage
+  levels $\tilde\alpha$ across test examples.
+  \item The distribution of $\tilde\alpha$ values shifts as $\lambda$
+  changes.
+  \item Empirical coverage is consistent with the post-hoc validity
+  guarantee (Proposition~2.2).
+\end{itemize}
+
+% -----------------------------------------------------------------------
+\section{Part 4: Reproducing a Published Result}
+% -----------------------------------------------------------------------
+
+Select one figure or table from the paper's experiments and reproduce it
+as faithfully as possible. Good candidates include:
+
+\begin{itemize}
+  \item Training dynamics of the coverage policy under different values
+  of $\lambda$ (Figure~1 in the paper).
+  \item Average prediction set size as a function of $\lambda$.
+  \item Empirical miscoverage as a function of $\lambda$.
+  \item The distribution of learned miscoverage levels $\tilde\alpha$
+  across test examples under different $\lambda$.
+\end{itemize}
+
+\subsection{Requirements}
+
+Use:
+\begin{itemize}
+  \item The same dataset (CIFAR-10).
+  \item The same score function (cross-entropy).
+  \item The same train/calibration/test protocol described in the paper.
+  \item The same evaluation metrics.
+\end{itemize}
+
+\subsection{Deliverables}
+
+\begin{enumerate}[label=\arabic*.]
+  \item The reproduced figure.
+  \item A one-page implementation summary.
+  \item A discussion of any discrepancies.
+\end{enumerate}
+
+% -----------------------------------------------------------------------
+\section{Part 5: Extension Study}
+% -----------------------------------------------------------------------
+
+The ACP framework trains a neural coverage policy on top of a
+conformal e-predictor. An important open question is whether its benefits
+depend on the choice of conformity score.
+
+In this part, investigate the interaction between ACP and two different
+conformity scores. Recall that the soft-rank e-variable requires scores to
+be \emph{non-negative and negatively oriented} (lower scores must indicate
+better predictions). Before plugging any score into the e-value construction,
+verify these two properties explicitly.
+
+\subsection{Candidate Scores}
+
+\begin{enumerate}
+
+\item \textbf{Cross-entropy score} (used in the paper):
+\[
+  S(x,y) = -\log \hat p_y(x).
+\]
+
+\item \textbf{APS score} (Romano et al., 2020): Sort classes in decreasing
+order of predicted probability; $S(x,y)$ is the cumulative predicted
+probability up to and including class $y$. Verify non-negativity and
+negative orientation before use.
+
+\end{enumerate}
+
+\subsection{Experiments}
+
+For each conformity score:
+\begin{itemize}
+  \item Train an ACP policy across several values of $\lambda$.
+  \item Measure average prediction set size and compare to the fixed-$\alpha$
+  conformal e-predictor baseline (without ACP).
+  \item Verify empirical coverage against the post-hoc validity guarantee.
+  \item Plot the distribution of learned miscoverage levels $\tilde\alpha$
+  across test examples.
+\end{itemize}
+
+\subsection{Research Questions}
+
+\begin{enumerate}[label=\arabic*.]
+  \item Does ACP consistently reduce average prediction set size regardless
+  of the conformity score?
+  \item Does the trained policy produce a similar distribution of
+  $\tilde\alpha$ values for both scores?
+  \item Which conformity score yields the largest efficiency gains from ACP?
+  \item Are the paper's conclusions robust to the choice of conformity score?
+  \item What properties of a conformity score appear to make it well-suited
+  for use within the ACP framework?
+\end{enumerate}
+
+% -----------------------------------------------------------------------
+\section{Final Report}
+% -----------------------------------------------------------------------
+
+Write a short report of approximately 3--5 pages, containing:
+
+\begin{enumerate}[label=\arabic*.]
+  \item Introduction.
+  \item Background on conformal prediction, e-values, and post-hoc validity.
+  \item Summary of the ACP methodology, including the soft-rank e-variable,
+  the training objective, and the leave-one-out procedure.
+  \item Reproduction study.
+  \item Extension study.
+  \item Conclusions.
+\end{enumerate}
+
+Focus on clear explanations, careful experimentation, and thoughtful
+interpretation of results.
+
+% -----------------------------------------------------------------------
+\section{Stretch Goal}
+% -----------------------------------------------------------------------
+
+For students interested in theory, study the validity guarantees of both
+split conformal prediction and ACP.
+
+\begin{enumerate}
+
+\item Explain why split conformal prediction achieves finite-sample marginal
+coverage under exchangeability.
+
+\item The soft-rank e-variable is:
+\[
+  E = \frac{S(X_{\mathrm{test}},Y_{\mathrm{test}})}
+           {\frac{1}{n+1}\!\left(\sum_{i=1}^{n} S(X_i,Y_i)
+            + S(X_{\mathrm{test}},Y_{\mathrm{test}})\right)}.
+\]
+Verify that $\mathbb{E}[E] \le 1$ when scores are exchangeable and
+non-negative, thereby confirming it is a valid e-variable.
+(\emph{Hint}: use exchangeability to argue that the test score is a uniform
+draw from the $n+1$ scores, then compute the expectation directly.)
+
+\item State the post-hoc validity guarantee (Proposition~2.2) precisely.
+Why does this guarantee hold even when $\tilde\alpha$ depends on all the
+data, whereas the standard guarantee (eq.~1) requires $\alpha$ to be fixed
+in advance?
+
+\item The ACP guarantee is
+\[
+  \mathbb{E}\!\left[\frac{\mathbb{P}(Y_{\mathrm{test}} \notin
+  \hat C_n^{\tilde\alpha}(X_{\mathrm{test}}) \mid \tilde\alpha)}
+  {\tilde\alpha}\right] \le 1,
+\]
+whereas the standard guarantee is
+$\mathbb{P}(Y_{\mathrm{test}} \notin \hat C_n^\alpha) \le \alpha$.
+Explain the difference between these two statements. Under what condition
+do they coincide?
+
+\end{enumerate}
+
+A complete proof is not required. The goal is to understand the structure
+of the arguments and the role of e-values in enabling post-hoc valid
+adaptive inference.
+
+\end{document}
