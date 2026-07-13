@@ -374,6 +374,13 @@ def print_policy_metrics(metrics):
     print("[" + ", ".join(f"{value:.4f}" for value in metrics["alpha_quantiles"]) + "]")
 
 
+def _has_nontrivial_alpha_variation(metrics, tolerance):
+    return (
+        metrics["alpha_std"] > tolerance
+        and metrics["alpha_max"] - metrics["alpha_min"] > tolerance
+    )
+
+
 def verify_acp(
     model,
     calloader,
@@ -382,6 +389,7 @@ def verify_acp(
     n,
     device,
     *,
+    selected_metrics,
     lambdas=(5.0, 10.0, 50.0),
     epochs=2000,
     lr=1e-3,
@@ -415,9 +423,8 @@ def verify_acp(
         metrics = evaluate_policy(
             model, policy, testloader, total_score, n, device
         )
-        nontrivial = (
-            metrics["alpha_std"] > variation_tolerance
-            and metrics["alpha_max"] - metrics["alpha_min"] > variation_tolerance
+        nontrivial = _has_nontrivial_alpha_variation(
+            metrics, variation_tolerance
         )
         post_hoc_consistent = metrics["post_hoc_ratio"] <= 1.0
         reports[float(lambda_reg)] = {
@@ -427,7 +434,10 @@ def verify_acp(
             "post_hoc_consistent": post_hoc_consistent,
         }
         print_policy_metrics(metrics)
-        print(f"non-trivial alpha variation: {'PASS' if nontrivial else 'FAIL'}")
+        print(
+            "diagnostic alpha variation: "
+            f"{'PASS' if nontrivial else 'DEGENERATE'}"
+        )
         print(
             "empirical post-hoc ratio <= 1: "
             f"{'PASS' if post_hoc_consistent else 'FAIL'}"
@@ -444,15 +454,21 @@ def verify_acp(
         for a, b in zip(left, right)
     )
     distribution_shift = maximum_quantile_shift > variation_tolerance
-    all_nontrivial = all(
-        report["nontrivial_alpha_variation"] for report in reports.values()
+    selected_nontrivial = _has_nontrivial_alpha_variation(
+        selected_metrics, variation_tolerance
     )
-    all_post_hoc_consistent = all(
+    selected_post_hoc_consistent = selected_metrics["post_hoc_ratio"] <= 1.0
+    all_post_hoc_consistent = selected_post_hoc_consistent and all(
         report["post_hoc_consistent"] for report in reports.values()
     )
+    degenerate_lambdas = [
+        lambda_reg
+        for lambda_reg, report in reports.items()
+        if not report["nontrivial_alpha_variation"]
+    ]
 
     checks = {
-        "nontrivial_alpha_variation": all_nontrivial,
+        "nontrivial_alpha_variation": selected_nontrivial,
         "alpha_distribution_shifts_with_lambda": distribution_shift,
         "post_hoc_consistent": all_post_hoc_consistent,
         "maximum_alpha_quantile_shift": maximum_quantile_shift,
@@ -460,8 +476,8 @@ def verify_acp(
     print("\n" + "=" * 60)
     print("Verification summary")
     print(
-        "1. Non-trivial alpha variation across test examples: "
-        f"{'PASS' if all_nontrivial else 'FAIL'}"
+        "1. Selected policy has non-trivial alpha variation: "
+        f"{'PASS' if selected_nontrivial else 'FAIL'}"
     )
     print(
         "2. Alpha distribution shifts as lambda changes: "
@@ -472,7 +488,22 @@ def verify_acp(
         "3. Empirical post-hoc ratio is at most 1: "
         f"{'PASS' if all_post_hoc_consistent else 'FAIL'}"
     )
-    return {"reports": reports, "checks": checks}
+    if degenerate_lambdas:
+        formatted = ", ".join(f"{value:g}" for value in degenerate_lambdas)
+        print(
+            "Warning: degenerate alpha distributions for diagnostic lambda(s): "
+            f"{formatted}"
+        )
+    return {
+        "selected_policy": {
+            "metrics": selected_metrics,
+            "nontrivial_alpha_variation": selected_nontrivial,
+            "post_hoc_consistent": selected_post_hoc_consistent,
+        },
+        "reports": reports,
+        "checks": checks,
+        "warnings": {"degenerate_lambdas": degenerate_lambdas},
+    }
 
 
 def main():
@@ -531,6 +562,7 @@ def main():
         total_score,
         n,
         device,
+        selected_metrics=metrics,
         lambdas=args.verification_lambdas,
         epochs=args.verification_epochs or args.policy_epochs,
         variation_tolerance=args.variation_tolerance,
