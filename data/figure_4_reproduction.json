@@ -1,0 +1,100 @@
+{
+  "target_size": 2.0,
+  "tolerance": 0.1,
+  "initial_lambda": 40.0,
+  "selected_lambda": 5.0,
+  "loo_size": 2.009999990463257,
+  "test_sample_size": 100,
+  "test_metrics": {
+    "coverage": 0.78,
+    "average_set_size": 2.26,
+    "alpha_mean": 0.6980574131011963,
+    "alpha_std": 0.15776067972183228,
+    "alpha_min": 0.16996115446090698,
+    "alpha_max": 0.8839896321296692,
+    "alpha_quantiles": [
+      0.16996115446090698,
+      0.48002558946609497,
+      0.6231565475463867,
+      0.7527226209640503,
+      0.8070597052574158,
+      0.851216197013855,
+      0.8839896321296692
+    ],
+    "post_hoc_ratio": 0.3089633155684925
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "lambda": 40.0,
+      "loo_size": 10.0,
+      "phase": "bracketing"
+    },
+    {
+      "iteration": 2,
+      "lambda": 20.0,
+      "loo_size": 5.679999828338623,
+      "phase": "bracketing"
+    },
+    {
+      "iteration": 3,
+      "lambda": 10.0,
+      "loo_size": 3.759999990463257,
+      "phase": "bracketing"
+    },
+    {
+      "iteration": 4,
+      "lambda": 5.0,
+      "loo_size": 2.009999990463257,
+      "phase": "bracketing"
+    },
+    {
+      "iteration": 5,
+      "lambda": 2.5,
+      "loo_size": 1.559999942779541,
+      "phase": "bracketing"
+    },
+    {
+      "iteration": 6,
+      "lambda": 3.75,
+      "loo_size": 1.6299999952316284,
+      "phase": "bisection"
+    },
+    {
+      "iteration": 7,
+      "lambda": 4.375,
+      "loo_size": 1.659999966621399,
+      "phase": "bisection"
+    },
+    {
+      "iteration": 8,
+      "lambda": 4.6875,
+      "loo_size": 1.7400000095367432,
+      "phase": "bisection"
+    },
+    {
+      "iteration": 9,
+      "lambda": 4.84375,
+      "loo_size": 1.840000033378601,
+      "phase": "bisection"
+    },
+    {
+      "iteration": 10,
+      "lambda": 4.921875,
+      "loo_size": 1.8899999856948853,
+      "phase": "bisection"
+    },
+    {
+      "iteration": 11,
+      "lambda": 4.9609375,
+      "loo_size": 1.8899999856948853,
+      "phase": "bisection"
+    },
+    {
+      "iteration": 12,
+      "lambda": 4.98046875,
+      "loo_size": 2.009999990463257,
+      "phase": "bisection"
+    }
+  ]
+}

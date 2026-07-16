@@ -12,11 +12,15 @@ then call ``run_colab()``. For a short smoke run, use::
 The default policy settings match the paper and are substantially slower.
 """
 
+import json
+import math
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 import torchvision
 from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from torchvision.transforms import v2
 
 
@@ -265,6 +269,7 @@ def select_lambda(
     lr=1e-3,
     k=100.0,
     batch_size=64,
+    return_history=False,
 ):
     """Algorithm 2: bracket and bisect lambda for a target set size."""
     if target_size <= 0 or tolerance <= 0 or initial_lambda <= 0:
@@ -276,8 +281,9 @@ def select_lambda(
     if target_size > cal_logits.size(1):
         raise ValueError("target_size cannot exceed the number of classes")
     best = None
+    history = []
 
-    def fit_and_measure(lam):
+    def fit_and_measure(lam, phase):
         nonlocal best
         policy = _train_policy_from_outputs(
             cal_logits,
@@ -292,42 +298,56 @@ def select_lambda(
         error = abs(size - target_size)
         if best is None or error < best[0]:
             best = (error, lam, policy, size)
+        history.append(
+            {
+                "iteration": len(history) + 1,
+                "lambda": float(lam),
+                "loo_size": size,
+                "phase": phase,
+            }
+        )
         print(f"lambda={lam:.6g}, loo_size={size:.4f}")
         return size
 
-    initial_size = fit_and_measure(initial_lambda)
+    def selection_result():
+        result = (best[1], best[2], best[3])
+        return (*result, history) if return_history else result
+
+    initial_size = fit_and_measure(initial_lambda, "bracketing")
     if abs(initial_size - target_size) <= tolerance:
-        return best[1], best[2], best[3]
+        return selection_result()
 
     if initial_size < target_size:
         lam_low = initial_lambda
         lam_high = initial_lambda
         for _ in range(max_steps):
+            lam_low = lam_high
             lam_high *= 2
-            if fit_and_measure(lam_high) >= target_size:
+            if fit_and_measure(lam_high, "bracketing") >= target_size:
                 break
         else:
-            return best[1], best[2], best[3]
+            return selection_result()
     else:
         lam_low = initial_lambda
         lam_high = initial_lambda
         for _ in range(max_steps):
+            lam_high = lam_low
             lam_low /= 2
-            if fit_and_measure(lam_low) <= target_size:
+            if fit_and_measure(lam_low, "bracketing") <= target_size:
                 break
         else:
-            return best[1], best[2], best[3]
+            return selection_result()
 
     for _ in range(max_steps):
         lam_mid = (lam_low + lam_high) / 2
-        size = fit_and_measure(lam_mid)
+        size = fit_and_measure(lam_mid, "bisection")
         if abs(size - target_size) <= tolerance:
             break
         if size < target_size:
             lam_low = lam_mid
         else:
             lam_high = lam_mid
-    return best[1], best[2], best[3]
+    return selection_result()
 
 
 @torch.no_grad()
@@ -426,6 +446,280 @@ def print_policy_metrics(metrics):
             print(f"{name}: {value:.4f}")
     print("alpha quantiles [0, .1, .25, .5, .75, .9, 1]:")
     print("[" + ", ".join(f"{value:.4f}" for value in metrics["alpha_quantiles"]) + "]")
+
+
+def _sample_test_loader(testloader, sample_size=100, seed=42):
+    if not 0 < sample_size <= len(testloader.dataset):
+        raise ValueError("sample_size must be between 1 and the test-set size")
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(testloader.dataset), generator=generator)[:sample_size]
+    sample = Subset(testloader.dataset, indices.tolist())
+    return DataLoader(
+        sample,
+        batch_size=min(testloader.batch_size or 64, sample_size),
+        shuffle=False,
+        num_workers=testloader.num_workers,
+        pin_memory=testloader.pin_memory,
+    )
+
+
+def plot_figure_four(history, target_size, tolerance, output_path):
+    """Plot Algorithm 2's mean LOO set size at every lambda trial."""
+    if not history:
+        raise ValueError("history must contain at least one record")
+
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        from PIL import Image, ImageDraw, ImageFont
+
+        width, height = 1200, 800
+        left, right, top, bottom = 120, 45, 35, 110
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        font = small_font = annotation_font = None
+        for font_path in (
+            "DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/google-noto-vf/NotoSerif[wght].ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+        ):
+            try:
+                font = ImageFont.truetype(font_path, 36)
+                small_font = ImageFont.truetype(font_path, 24)
+                annotation_font = ImageFont.truetype(font_path, 18)
+                break
+            except OSError:
+                continue
+        if font is None:
+            font = small_font = annotation_font = ImageFont.load_default()
+            lambda_prefix = "lambda"
+        else:
+            lambda_prefix = "λ"
+        sizes = [record["loo_size"] for record in history]
+        y_min = 0.0
+        y_tick_step = 2.0
+        largest_value = max(sizes + [target_size + tolerance])
+        y_tick_max = max(y_tick_step, math.ceil(largest_value / y_tick_step) * y_tick_step)
+        y_max = y_tick_max + 0.25 * y_tick_step
+
+        def x_pixel(iteration):
+            x_min = min(record["iteration"] for record in history) - 0.2
+            x_max = max(record["iteration"] for record in history) + 0.2
+            return left + (iteration - x_min) * (width - left - right) / (x_max - x_min)
+
+        def y_pixel(value):
+            return top + (y_max - value) * (height - top - bottom) / (y_max - y_min)
+
+        band_top = y_pixel(target_size + tolerance)
+        band_bottom = y_pixel(target_size - tolerance)
+        draw.rectangle((left, band_top, width - right, band_bottom), fill="#ffcccc")
+        for record in history:
+            grid_x = x_pixel(record["iteration"])
+            draw.line((grid_x, top, grid_x, height - bottom), fill="#b0b0b0", width=1)
+        for tick in range(int(y_tick_max / y_tick_step) + 1):
+            value = tick * y_tick_step
+            tick_y = y_pixel(value)
+            draw.line((left, tick_y, width - right, tick_y), fill="#b0b0b0", width=1)
+            draw.text((left - 60, tick_y - 10), f"{value:g}", fill="black", font=small_font)
+        target_y = y_pixel(target_size)
+        for x_start in range(left, width - right, 24):
+            draw.line((x_start, target_y, min(x_start + 12, width - right), target_y), fill="red", width=4)
+        draw.line((left, top, left, height - bottom), fill="black", width=3)
+        draw.line((left, height - bottom, width - right, height - bottom), fill="black", width=3)
+
+        points = [
+            (x_pixel(record["iteration"]), y_pixel(record["loo_size"]))
+            for record in history
+        ]
+        if len(points) > 1:
+            draw.line(points, fill="#1f77b4", width=6)
+        for record, (x_value, y_value) in zip(history, points):
+            draw.ellipse(
+                (x_value - 9, y_value - 9, x_value + 9, y_value + 9),
+                fill="#1f77b4",
+            )
+            near_target = record["loo_size"] <= target_size + tolerance
+            label_y = y_value + 13 if near_target and record["iteration"] % 2 else y_value - 27
+            annotation = f"{lambda_prefix}={record['lambda']:.4g}"
+            annotation_x = x_value + 8
+            if record is history[-1]:
+                annotation_width = draw.textbbox(
+                    (0, 0), annotation, font=annotation_font
+                )[2]
+                annotation_x = x_value - annotation_width - 8
+            draw.text(
+                (annotation_x, label_y),
+                annotation,
+                fill="black",
+                font=annotation_font,
+            )
+            draw.text((x_value - 5, height - bottom + 18), str(record["iteration"]), fill="black", font=small_font)
+        draw.text((width // 2 - 40, height - 52), "Iteration", fill="black", font=font)
+        y_label = Image.new("RGBA", (220, 60), (255, 255, 255, 0))
+        ImageDraw.Draw(y_label).text((0, 5), "Mean Size", fill="black", font=font)
+        rotated_label = y_label.rotate(90, expand=True)
+        image.paste(
+            rotated_label,
+            (0, (height - rotated_label.height) // 2),
+            rotated_label,
+        )
+
+        legend_left, legend_top = width - 315, 55
+        draw.rectangle((legend_left, legend_top, width - 60, 175), fill="white", outline="#cccccc")
+        draw.line((legend_left + 15, 82, legend_left + 65, 82), fill="#1f77b4", width=5)
+        draw.ellipse((legend_left + 33, 74, legend_left + 49, 90), fill="#1f77b4")
+        draw.text((legend_left + 75, 69), "Mean Size", fill="black", font=small_font)
+        for x_start in range(legend_left + 15, legend_left + 65, 16):
+            draw.line((x_start, 116, x_start + 9, 116), fill="red", width=4)
+        draw.text((legend_left + 75, 103), f"Target M={target_size:g}", fill="black", font=small_font)
+        draw.rectangle((legend_left + 15, 142, legend_left + 65, 158), fill="#ffcccc")
+        draw.text((legend_left + 75, 136), f"Tolerance ±{tolerance:g}", fill="black", font=small_font)
+        image.save(output_path)
+        return image
+
+    iterations = [record["iteration"] for record in history]
+    sizes = [record["loo_size"] for record in history]
+    largest_value = max(sizes + [target_size + tolerance])
+    y_tick_step = 2.0
+    y_tick_max = max(y_tick_step, math.ceil(largest_value / y_tick_step) * y_tick_step)
+    figure, axis = plt.subplots(figsize=(7.0, 4.5))
+    axis.plot(
+        iterations,
+        sizes,
+        color="#1f77b4",
+        marker="o",
+        linewidth=3,
+        markersize=8,
+        label="Mean Size",
+    )
+    axis.axhline(
+        target_size,
+        color="red",
+        linewidth=2.5,
+        linestyle="--",
+        label=f"Target M={target_size:g}",
+    )
+    axis.axhspan(
+        target_size - tolerance,
+        target_size + tolerance,
+        color="red",
+        alpha=0.15,
+        label=f"Tolerance ±{tolerance:g}",
+    )
+    for record in history:
+        near_target = record["loo_size"] <= target_size + tolerance
+        vertical_offset = -15 if near_target and record["iteration"] % 2 else 9
+        is_last = record is history[-1]
+        axis.annotate(
+            rf"$\lambda$={record['lambda']:.4g}",
+            (record["iteration"], record["loo_size"]),
+            xytext=(-8 if is_last else 8, vertical_offset),
+            textcoords="offset points",
+            fontsize=9,
+            horizontalalignment="right" if is_last else "left",
+        )
+    axis.set_xlabel("Iteration", fontsize=16)
+    axis.set_ylabel("Mean Size", fontsize=16, labelpad=18)
+    axis.set_xticks(iterations)
+    axis.set_xlim(min(iterations) - 0.2, max(iterations) + 0.2)
+    axis.set_ylim(0, y_tick_max + 0.25 * y_tick_step)
+    axis.set_yticks(
+        [tick * y_tick_step for tick in range(int(y_tick_max / y_tick_step) + 1)]
+    )
+    axis.tick_params(axis="both", labelsize=12)
+    axis.grid(True, color="#b0b0b0", alpha=0.7)
+    axis.legend(loc="upper right", fontsize=11)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=300, bbox_inches="tight")
+    return figure
+
+
+def reproduce_figure_four(
+    model,
+    calloader,
+    testloader,
+    device,
+    *,
+    target_size=2.0,
+    tolerance=0.1,
+    initial_lambda=40.0,
+    max_steps=8,
+    policy_epochs=2000,
+    policy_lr=1e-3,
+    k=100.0,
+    policy_batch_size=64,
+    test_sample_size=100,
+    test_seed=42,
+    output_path="figure_4_reproduction.png",
+    results_path=None,
+):
+    """Reproduce Figure 4 using the paper's Algorithm 2 settings."""
+    selected_lambda, policy, loo_size, history = select_lambda(
+        model,
+        calloader,
+        device,
+        target_size=target_size,
+        tolerance=tolerance,
+        initial_lambda=initial_lambda,
+        max_steps=max_steps,
+        epochs=policy_epochs,
+        lr=policy_lr,
+        k=k,
+        batch_size=policy_batch_size,
+        return_history=True,
+    )
+    total_score, n = get_cal_total_score(model, calloader, device)
+    sampled_testloader = _sample_test_loader(
+        testloader, sample_size=test_sample_size, seed=test_seed
+    )
+    test_metrics = evaluate_policy(
+        model, policy, sampled_testloader, total_score, n, device
+    )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure = plot_figure_four(history, target_size, tolerance, output_path)
+    if results_path is None:
+        results_path = Path("data") / f"{Path(output_path).stem}.json"
+    results_path = Path(results_path)
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    serializable_metrics = {
+        name: value for name, value in test_metrics.items()
+    }
+    with results_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            {
+                "target_size": target_size,
+                "tolerance": tolerance,
+                "initial_lambda": initial_lambda,
+                "selected_lambda": selected_lambda,
+                "loo_size": loo_size,
+                "test_sample_size": test_sample_size,
+                "test_metrics": serializable_metrics,
+                "history": history,
+            },
+            file,
+            indent=2,
+        )
+
+    print(f"\nFigure 4 saved to {output_path}")
+    print(f"Figure 4 data saved to {results_path}")
+    print(f"selected lambda: {selected_lambda:.6g}")
+    print(f"final mean LOO size: {loo_size:.4f}")
+    print(
+        f"mean test size over {test_sample_size} sampled points: "
+        f"{test_metrics['average_set_size']:.4f}"
+    )
+    return {
+        "figure": figure,
+        "history": history,
+        "selected_lambda": selected_lambda,
+        "policy": policy,
+        "loo_size": loo_size,
+        "test_metrics": test_metrics,
+        "output_path": str(output_path),
+        "results_path": str(results_path),
+    }
 
 
 def _has_nontrivial_alpha_variation(metrics, tolerance):
@@ -641,6 +935,68 @@ def run_colab(
     }
 
 
+def run_figure_four_colab(
+    classifier_epochs=5,
+    policy_epochs=2000,
+    max_lambda_steps=8,
+    batch_size=64,
+    seed=42,
+    output_path="figure_4_reproduction.png",
+    results_path="data/figure_4_reproduction.json",
+):
+    """Train the current classifier and run the dedicated Figure 4 experiment."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+    if device.type != "cuda":
+        print("Warning: enable a GPU via Runtime > Change runtime type.")
+
+    trainloader, calloader, testloader = load_data(batch_size=batch_size)
+    model = MLP().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+    print("\nTraining base classifier...")
+    for epoch in range(classifier_epochs):
+        train_loss = train_classifier_epoch(
+            model, trainloader, criterion, optimizer, device
+        )
+        test_loss, test_accuracy = evaluate_classifier(
+            model, testloader, criterion, device
+        )
+        print(
+            f"classifier epoch {epoch + 1}: train_loss={train_loss:.4f}, "
+            f"test_loss={test_loss:.4f}, test_accuracy={test_accuracy:.4f}"
+        )
+
+    reproduction = reproduce_figure_four(
+        model,
+        calloader,
+        testloader,
+        device,
+        target_size=2.0,
+        tolerance=0.1,
+        initial_lambda=40.0,
+        max_steps=max_lambda_steps,
+        policy_epochs=policy_epochs,
+        policy_batch_size=64,
+        test_sample_size=100,
+        test_seed=seed,
+        output_path=output_path,
+        results_path=results_path,
+    )
+    try:
+        from IPython.display import display
+
+        display(reproduction["figure"])
+    except ImportError:
+        pass
+    reproduction["model"] = model
+    return reproduction
+
+
 # In Colab, run one of these in a new cell after loading this file:
 #
 # Quick smoke run:
@@ -648,3 +1004,6 @@ def run_colab(
 #
 # Full default run:
 # results = run_colab()
+#
+# Figure 4 reproduction:
+# figure_four_results = run_figure_four_colab()

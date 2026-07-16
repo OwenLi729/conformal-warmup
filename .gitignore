@@ -1,4 +1,6 @@
-data/
+data/*
+!data/figure_4_reproduction.json
 __pycache__/
 *.py[cod]
 *$py.class
+FIGURE_FOUR_ANALYSIS.md
