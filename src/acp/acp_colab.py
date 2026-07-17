@@ -130,9 +130,66 @@ def score(logits, labels):
     return F.cross_entropy(logits, labels, reduction="none")
 
 
-def candidate_scores(logits):
+def aps_score(logits, labels):
+    """APS score (Romano et al., 2020): Sort classes in decreasing order of predicted probability;
+    S(x, y) is the cumulative predicted probability up to and including class y."""
+
+    probabilities = F.softmax(logits, dim=1)
+    sorted_probabilities, sorted_labels = probabilities.sort(
+        dim=1, descending=True, stable=True
+    )
+    cumulative_probabilities = sorted_probabilities.cumsum(dim=1)
+    label_ranks = sorted_labels.argsort(dim=1).gather(1, labels[:, None])
+    return cumulative_probabilities.gather(1, label_ranks).squeeze(1)
+
+
+SCORE_TYPES = ("cross_entropy", "aps")
+
+
+def aps_candidate_scores(logits):
+    """Return the APS score for every candidate label in every row."""
+    probabilities = F.softmax(logits, dim=1)
+    sorted_probabilities, sorted_labels = probabilities.sort(
+        dim=1, descending=True, stable=True
+    )
+    cumulative_probabilities = sorted_probabilities.cumsum(dim=1)
+    return torch.zeros_like(cumulative_probabilities).scatter(
+        1, sorted_labels, cumulative_probabilities
+    )
+
+
+def candidate_scores(logits, score_type="cross_entropy"):
     """Return S(x, y) for every row x and candidate label y."""
-    return -F.log_softmax(logits, dim=1)
+    if score_type == "cross_entropy":
+        return -F.log_softmax(logits, dim=1)
+    if score_type == "aps":
+        return aps_candidate_scores(logits)
+    raise ValueError(
+        f"unknown score_type {score_type!r}; expected one of {SCORE_TYPES}"
+    )
+
+
+@torch.no_grad()
+def score_property_report(logits, score_type, tolerance=1e-7):
+    """Check the score properties required by the soft-rank e-variable."""
+    scores = candidate_scores(logits, score_type)
+    probabilities = F.softmax(logits, dim=1)
+    order = probabilities.argsort(dim=1, descending=True, stable=True)
+    ordered_scores = scores.gather(1, order)
+    finite = bool(torch.isfinite(scores).all().item())
+    nonnegative = bool((scores >= -tolerance).all().item())
+    negatively_oriented = bool(
+        (ordered_scores[:, 1:] >= ordered_scores[:, :-1] - tolerance)
+        .all()
+        .item()
+    )
+    return {
+        "finite": finite,
+        "nonnegative": nonnegative,
+        "negatively_oriented": negatively_oriented,
+        "min_score": scores.min().item(),
+        "max_score": scores.max().item(),
+    }
 
 
 def soft_rank(total_score, n, test_scores):
@@ -140,9 +197,11 @@ def soft_rank(total_score, n, test_scores):
     return (n + 1) * test_scores / (total_score + test_scores)
 
 
-def smooth_size(logits, total_score, n, alpha, k=100.0):
+def smooth_size(
+    logits, total_score, n, alpha, k=100.0, score_type="cross_entropy"
+):
     """Sigmoid approximation to classification set size (Equation 5)."""
-    test_scores = candidate_scores(logits)
+    test_scores = candidate_scores(logits, score_type)
     total_score = torch.as_tensor(
         total_score, device=logits.device, dtype=logits.dtype
     ).reshape(-1, 1)
@@ -158,7 +217,7 @@ def policy_loss(smooth_sizes, alphas, lambda_reg):
 
 
 @torch.no_grad()
-def _calibration_outputs(model, calloader, device):
+def _calibration_outputs(model, calloader, device, score_type="cross_entropy"):
     model.eval()
     logits = []
     labels = []
@@ -167,7 +226,15 @@ def _calibration_outputs(model, calloader, device):
         labels.append(targets.to(device, non_blocking=True))
     logits = torch.cat(logits)
     labels = torch.cat(labels)
-    return logits, score(logits, labels)
+    if score_type == "cross_entropy":
+        cal_scores = score(logits, labels)
+    elif score_type == "aps":
+        cal_scores = aps_score(logits, labels)
+    else:
+        raise ValueError(
+            f"unknown score_type {score_type!r}; expected one of {SCORE_TYPES}"
+        )
+    return logits, cal_scores
 
 
 def _train_policy_from_outputs(
@@ -179,13 +246,14 @@ def _train_policy_from_outputs(
     lr,
     k,
     batch_size,
+    score_type="cross_entropy",
 ):
     n, num_classes = cal_logits.shape
     if n < 2:
         raise ValueError("policy training requires at least two calibration points")
 
     loo_totals = cal_scores.sum() - cal_scores
-    summaries = candidate_scores(cal_logits)
+    summaries = candidate_scores(cal_logits, score_type)
     policy = CoveragePolicy(num_classes=num_classes).to(cal_logits.device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
 
@@ -201,6 +269,7 @@ def _train_policy_from_outputs(
                 n - 1,
                 alphas,
                 k=k,
+                score_type=score_type,
             )
             loss = policy_loss(sizes, alphas, lambda_reg)
             optimizer.zero_grad()
@@ -222,8 +291,11 @@ def train_policy(
     lr=1e-3,
     k=100.0,
     batch_size=64,
+    score_type="cross_entropy",
 ):
-    cal_logits, cal_scores = _calibration_outputs(model, calloader, device)
+    cal_logits, cal_scores = _calibration_outputs(
+        model, calloader, device, score_type
+    )
     return _train_policy_from_outputs(
         cal_logits,
         cal_scores,
@@ -232,6 +304,7 @@ def train_policy(
         lr=lr,
         k=k,
         batch_size=batch_size,
+        score_type=score_type,
     )
 
 
@@ -246,11 +319,13 @@ def _e_set_mask(test_scores, total_score, n, alpha):
 
 
 @torch.no_grad()
-def _loo_policy_size_from_outputs(policy, cal_logits, cal_scores):
+def _loo_policy_size_from_outputs(
+    policy, cal_logits, cal_scores, score_type="cross_entropy"
+):
     policy.eval()
     n = cal_scores.numel()
     loo_totals = cal_scores.sum() - cal_scores
-    summaries = candidate_scores(cal_logits)
+    summaries = candidate_scores(cal_logits, score_type)
     alphas = policy(loo_totals, summaries)
     mask = _e_set_mask(summaries, loo_totals, n - 1, alphas)
     return mask.sum(dim=1).float().mean().item()
@@ -270,6 +345,7 @@ def select_lambda(
     k=100.0,
     batch_size=64,
     return_history=False,
+    score_type="cross_entropy",
 ):
     """Algorithm 2: bracket and bisect lambda for a target set size."""
     if target_size <= 0 or tolerance <= 0 or initial_lambda <= 0:
@@ -277,7 +353,9 @@ def select_lambda(
     if max_steps < 1:
         raise ValueError("max_steps must be positive")
 
-    cal_logits, cal_scores = _calibration_outputs(model, calloader, device)
+    cal_logits, cal_scores = _calibration_outputs(
+        model, calloader, device, score_type
+    )
     if target_size > cal_logits.size(1):
         raise ValueError("target_size cannot exceed the number of classes")
     best = None
@@ -293,8 +371,11 @@ def select_lambda(
             lr=lr,
             k=k,
             batch_size=batch_size,
+            score_type=score_type,
         )
-        size = _loo_policy_size_from_outputs(policy, cal_logits, cal_scores)
+        size = _loo_policy_size_from_outputs(
+            policy, cal_logits, cal_scores, score_type
+        )
         error = abs(size - target_size)
         if best is None or error < best[0]:
             best = (error, lam, policy, size)
@@ -359,10 +440,11 @@ def make_e_sets(
     n,
     policy=None,
     return_alphas=False,
+    score_type="cross_entropy",
 ):
     model.eval()
     logits = model(x)
-    summaries = candidate_scores(logits)
+    summaries = candidate_scores(logits, score_type)
     total_score = torch.as_tensor(
         total_score, device=logits.device, dtype=logits.dtype
     )
@@ -385,21 +467,40 @@ def make_e_sets(
 
 
 @torch.no_grad()
-def get_cal_total_score(model, calloader, device):
+def get_cal_total_score(
+    model, calloader, device, score_type="cross_entropy"
+):
     model.eval()
     total_score = torch.zeros((), device=device)
     n = 0
     for inputs, targets in calloader:
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        batch_scores = score(model(inputs), targets)
+        logits = model(inputs)
+        if score_type == "cross_entropy":
+            batch_scores = score(logits, targets)
+        elif score_type == "aps":
+            batch_scores = aps_score(logits, targets)
+        else:
+            raise ValueError(
+                f"unknown score_type {score_type!r}; expected one of {SCORE_TYPES}"
+            )
         total_score += batch_scores.sum()
         n += batch_scores.numel()
     return total_score, n
 
 
 @torch.no_grad()
-def evaluate_policy(model, policy, testloader, total_score, n, device):
+def evaluate_policy(
+    model,
+    policy,
+    testloader,
+    total_score,
+    n,
+    device,
+    score_type="cross_entropy",
+    return_alpha_values=False,
+):
     total = 0
     covered = 0
     total_set_size = 0
@@ -416,6 +517,7 @@ def evaluate_policy(model, policy, testloader, total_score, n, device):
             n=n,
             policy=policy,
             return_alphas=True,
+            score_type=score_type,
         )
         for cset, target, alpha in zip(csets, targets.tolist(), batch_alphas):
             is_covered = target in cset
@@ -427,7 +529,7 @@ def evaluate_policy(model, policy, testloader, total_score, n, device):
 
     alpha_tensor = torch.tensor(alphas)
     quantile_levels = torch.tensor([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0])
-    return {
+    metrics = {
         "coverage": covered / total,
         "average_set_size": total_set_size / total,
         "alpha_mean": alpha_tensor.mean().item(),
@@ -437,15 +539,580 @@ def evaluate_policy(model, policy, testloader, total_score, n, device):
         "alpha_quantiles": torch.quantile(alpha_tensor, quantile_levels).tolist(),
         "post_hoc_ratio": sum(posthoc_ratios) / len(posthoc_ratios),
     }
+    if return_alpha_values:
+        metrics["alpha_values"] = alphas
+    return metrics
+
+
+@torch.no_grad()
+def evaluate_fixed_alpha(
+    model,
+    testloader,
+    total_score,
+    n,
+    device,
+    alpha=0.1,
+    score_type="cross_entropy",
+):
+    """Evaluate the fixed-alpha conformal e-predictor baseline."""
+    total = 0
+    covered = 0
+    total_set_size = 0
+    for inputs, targets in testloader:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        csets = make_e_sets(
+            model,
+            inputs,
+            alpha=alpha,
+            total_score=total_score,
+            n=n,
+            policy=None,
+            score_type=score_type,
+        )
+        for cset, target in zip(csets, targets.tolist()):
+            total += 1
+            covered += int(target in cset)
+            total_set_size += len(cset)
+    coverage = covered / total
+    return {
+        "alpha": alpha,
+        "coverage": coverage,
+        "average_set_size": total_set_size / total,
+        "miscoverage_ratio": (1.0 - coverage) / alpha,
+    }
 
 
 def print_policy_metrics(metrics):
     """Print scalar metrics and the alpha-distribution quantiles."""
     for name, value in metrics.items():
-        if name != "alpha_quantiles":
+        if name not in {"alpha_quantiles", "alpha_values"}:
             print(f"{name}: {value:.4f}")
     print("alpha quantiles [0, .1, .25, .5, .75, .9, 1]:")
     print("[" + ", ".join(f"{value:.4f}" for value in metrics["alpha_quantiles"]) + "]")
+
+
+def _mean_std(values):
+    values = torch.tensor(values, dtype=torch.float64)
+    return {
+        "mean": values.mean().item(),
+        "std": values.std(unbiased=False).item(),
+    }
+
+
+def _aggregate_extension_runs(runs, lambdas):
+    summary = {}
+    for score_type in SCORE_TYPES:
+        score_runs = [run["scores"][score_type] for run in runs]
+        baseline = {
+            metric: _mean_std(
+                [run["baseline"][metric] for run in score_runs]
+            )
+            for metric in ("coverage", "average_set_size", "miscoverage_ratio")
+        }
+        lambda_summaries = {}
+        for lambda_reg in lambdas:
+            key = f"{lambda_reg:g}"
+            policies = [run["policies"][key] for run in score_runs]
+            lambda_summary = {
+                metric: _mean_std([policy[metric] for policy in policies])
+                for metric in (
+                    "coverage",
+                    "average_set_size",
+                    "post_hoc_ratio",
+                    "alpha_mean",
+                    "alpha_std",
+                    "absolute_efficiency_gain",
+                    "relative_efficiency_gain",
+                )
+            }
+            quantiles = torch.tensor(
+                [policy["alpha_quantiles"] for policy in policies]
+            )
+            lambda_summary["alpha_quantiles_mean"] = quantiles.mean(dim=0).tolist()
+            lambda_summary["alpha_quantiles_std"] = quantiles.std(
+                dim=0, unbiased=False
+            ).tolist()
+            lambda_summary["post_hoc_consistent_all_seeds"] = all(
+                policy["post_hoc_ratio"] <= 1.0 for policy in policies
+            )
+            lambda_summary["size_reduction_all_seeds"] = all(
+                policy["absolute_efficiency_gain"] > 0.0 for policy in policies
+            )
+            lambda_summaries[key] = lambda_summary
+        summary[score_type] = {
+            "baseline": baseline,
+            "lambdas": lambda_summaries,
+        }
+
+    candidates = []
+    for score_type in SCORE_TYPES:
+        for lambda_reg in lambdas:
+            key = f"{lambda_reg:g}"
+            metrics = summary[score_type]["lambdas"][key]
+            if metrics["post_hoc_consistent_all_seeds"]:
+                candidates.append(
+                    {
+                        "score_type": score_type,
+                        "lambda": lambda_reg,
+                        "absolute_gain": metrics["absolute_efficiency_gain"]["mean"],
+                        "relative_gain": metrics["relative_efficiency_gain"]["mean"],
+                    }
+                )
+    best = max(candidates, key=lambda item: item["relative_gain"], default=None)
+    quantile_gaps = {}
+    for lambda_reg in lambdas:
+        key = f"{lambda_reg:g}"
+        cross_entropy = summary["cross_entropy"]["lambdas"][key][
+            "alpha_quantiles_mean"
+        ]
+        aps = summary["aps"]["lambdas"][key]["alpha_quantiles_mean"]
+        quantile_gaps[key] = max(abs(left - right) for left, right in zip(cross_entropy, aps))
+    summary["research_checks"] = {
+        "reduction_consistent_for_both_scores": all(
+            summary[score_type]["lambdas"][f"{lambda_reg:g}"][
+                "size_reduction_all_seeds"
+            ]
+            for score_type in SCORE_TYPES
+            for lambda_reg in lambdas
+        ),
+        "maximum_alpha_quantile_gap_by_lambda": quantile_gaps,
+        "largest_valid_efficiency_gain": best,
+    }
+    return summary
+
+
+def _plot_extension_efficiency(summary, lambdas, output_path):
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        from PIL import Image, ImageDraw
+
+        width, height = 1200, 800
+        left, right, top, bottom = 100, 50, 50, 100
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        colors = {"cross_entropy": "#1f77b4", "aps": "#ff7f0e"}
+        all_sizes = []
+        for score_type in SCORE_TYPES:
+            all_sizes.append(summary[score_type]["baseline"]["average_set_size"]["mean"])
+            all_sizes.extend(
+                summary[score_type]["lambdas"][f"{value:g}"]["average_set_size"]["mean"]
+                for value in lambdas
+            )
+        y_max = max(1.0, max(all_sizes) * 1.1)
+
+        def x_pixel(index):
+            return left + index * (width - left - right) / max(1, len(lambdas) - 1)
+
+        def y_pixel(value):
+            return top + (y_max - value) * (height - top - bottom) / y_max
+
+        for tick in range(6):
+            value = tick * y_max / 5
+            y_value = y_pixel(value)
+            draw.line((left, y_value, width - right, y_value), fill="#dddddd")
+            draw.text((20, y_value - 7), f"{value:.1f}", fill="black")
+        for score_type in SCORE_TYPES:
+            color = colors[score_type]
+            means = [
+                summary[score_type]["lambdas"][f"{value:g}"]["average_set_size"]["mean"]
+                for value in lambdas
+            ]
+            points = [(x_pixel(index), y_pixel(value)) for index, value in enumerate(means)]
+            if len(points) > 1:
+                draw.line(points, fill=color, width=4)
+            for point in points:
+                draw.ellipse((point[0] - 6, point[1] - 6, point[0] + 6, point[1] + 6), fill=color)
+            baseline = summary[score_type]["baseline"]["average_set_size"]["mean"]
+            baseline_y = y_pixel(baseline)
+            for x_start in range(left, width - right, 24):
+                draw.line((x_start, baseline_y, min(x_start + 12, width - right), baseline_y), fill=color, width=2)
+        draw.line((left, top, left, height - bottom), fill="black", width=3)
+        draw.line((left, height - bottom, width - right, height - bottom), fill="black", width=3)
+        for index, value in enumerate(lambdas):
+            draw.text((x_pixel(index) - 8, height - bottom + 20), f"{value:g}", fill="black")
+        draw.text((width // 2 - 25, height - 45), "Lambda", fill="black")
+        draw.text((20, 20), "Mean set size: CE=blue, APS=orange; dashed=fixed alpha", fill="black")
+        image.save(output_path)
+        return
+
+    figure, axis = plt.subplots(figsize=(7.0, 4.5))
+    colors = {"cross_entropy": "#1f77b4", "aps": "#ff7f0e"}
+    labels = {"cross_entropy": "Cross-entropy", "aps": "APS"}
+    for score_type in SCORE_TYPES:
+        means = [
+            summary[score_type]["lambdas"][f"{value:g}"]["average_set_size"]["mean"]
+            for value in lambdas
+        ]
+        stds = [
+            summary[score_type]["lambdas"][f"{value:g}"]["average_set_size"]["std"]
+            for value in lambdas
+        ]
+        axis.errorbar(
+            lambdas,
+            means,
+            yerr=stds,
+            marker="o",
+            linewidth=2,
+            capsize=4,
+            color=colors[score_type],
+            label=f"{labels[score_type]} ACP",
+        )
+        baseline = summary[score_type]["baseline"]["average_set_size"]["mean"]
+        axis.axhline(
+            baseline,
+            color=colors[score_type],
+            linestyle="--",
+            alpha=0.75,
+            label=f"{labels[score_type]} fixed α=0.10",
+        )
+    axis.set_xlabel("λ")
+    axis.set_ylabel("Average prediction-set size")
+    axis.set_xticks(lambdas)
+    axis.grid(True, alpha=0.3)
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=200)
+    plt.close(figure)
+
+
+def _plot_extension_alpha_distributions(raw_alphas, lambdas, output_path):
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        from PIL import Image, ImageDraw
+
+        width, height = 1500, 500
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        colors = {"cross_entropy": "#1f77b4", "aps": "#ff7f0e"}
+        bins = 30
+        panel_width = width // len(lambdas)
+        for panel, lambda_reg in enumerate(lambdas):
+            panel_left = panel * panel_width + 55
+            panel_right = (panel + 1) * panel_width - 25
+            top, bottom = 45, height - 65
+            histograms = {}
+            maximum = 1.0
+            for score_type in SCORE_TYPES:
+                values = torch.tensor(raw_alphas[score_type][f"{lambda_reg:g}"])
+                histogram = torch.histc(values, bins=bins, min=0.0, max=1.0)
+                histograms[score_type] = histogram
+                maximum = max(maximum, histogram.max().item())
+            for score_type in SCORE_TYPES:
+                histogram = histograms[score_type]
+                points = []
+                for index, count in enumerate(histogram.tolist()):
+                    x_value = panel_left + index * (panel_right - panel_left) / (bins - 1)
+                    y_value = bottom - count * (bottom - top) / maximum
+                    points.append((x_value, y_value))
+                draw.line(points, fill=colors[score_type], width=3)
+            draw.line((panel_left, top, panel_left, bottom), fill="black", width=2)
+            draw.line((panel_left, bottom, panel_right, bottom), fill="black", width=2)
+            title_x = panel_left + (panel_right - panel_left) // 2 - 30
+            draw.text((title_x, 15), f"lambda={lambda_reg:g}", fill="black")
+            draw.text((panel_left, bottom + 15), "0", fill="black")
+            draw.text((panel_right - 8, bottom + 15), "1", fill="black")
+        draw.text((width // 2 - 80, height - 25), "Adaptive alpha", fill="black")
+        draw.text((width - 170, 15), "CE=blue, APS=orange", fill="black")
+        image.save(output_path)
+        return
+
+    figure, axes = plt.subplots(1, len(lambdas), figsize=(5 * len(lambdas), 4), sharey=True)
+    if len(lambdas) == 1:
+        axes = [axes]
+    colors = {"cross_entropy": "#1f77b4", "aps": "#ff7f0e"}
+    labels = {"cross_entropy": "Cross-entropy", "aps": "APS"}
+    for axis, lambda_reg in zip(axes, lambdas):
+        key = f"{lambda_reg:g}"
+        for score_type in SCORE_TYPES:
+            axis.hist(
+                raw_alphas[score_type][key],
+                bins=30,
+                range=(0, 1),
+                density=True,
+                histtype="step",
+                linewidth=2,
+                color=colors[score_type],
+                label=labels[score_type],
+            )
+        axis.set_title(f"λ={lambda_reg:g}")
+        axis.set_xlabel(r"Adaptive $\tilde{\alpha}$")
+        axis.grid(True, alpha=0.25)
+    axes[0].set_ylabel("Density")
+    axes[-1].legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=200)
+    plt.close(figure)
+
+
+def _run_extension_for_model(
+    model,
+    calloader,
+    testloader,
+    device,
+    *,
+    seed,
+    lambdas,
+    fixed_alpha,
+    policy_epochs,
+    policy_lr,
+    k,
+    policy_batch_size,
+):
+    run = {"seed": seed, "scores": {}}
+    raw_alphas = {
+        score_type: {f"{lambda_reg:g}": [] for lambda_reg in lambdas}
+        for score_type in SCORE_TYPES
+    }
+    for score_type in SCORE_TYPES:
+        print(f"\nSeed {seed}: score={score_type}")
+        cal_logits, cal_scores = _calibration_outputs(
+            model, calloader, device, score_type
+        )
+        properties = score_property_report(cal_logits, score_type)
+        required_checks = (
+            properties["finite"],
+            properties["nonnegative"],
+            properties["negatively_oriented"],
+        )
+        if not all(required_checks):
+            raise ValueError(
+                f"{score_type} failed required score checks: {properties}"
+            )
+        print(f"score properties: {properties}")
+        total_score = cal_scores.sum()
+        n = cal_scores.numel()
+        baseline = evaluate_fixed_alpha(
+            model,
+            testloader,
+            total_score,
+            n,
+            device,
+            alpha=fixed_alpha,
+            score_type=score_type,
+        )
+        policies = {}
+        for lambda_index, lambda_reg in enumerate(lambdas):
+            policy_seed = seed * 1000 + lambda_index
+            torch.manual_seed(policy_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(policy_seed)
+            print(f"\nscore={score_type}, lambda={lambda_reg:g}")
+            policy = _train_policy_from_outputs(
+                cal_logits,
+                cal_scores,
+                lambda_reg,
+                epochs=policy_epochs,
+                lr=policy_lr,
+                k=k,
+                batch_size=policy_batch_size,
+                score_type=score_type,
+            )
+            metrics = evaluate_policy(
+                model,
+                policy,
+                testloader,
+                total_score,
+                n,
+                device,
+                score_type=score_type,
+                return_alpha_values=True,
+            )
+            key = f"{lambda_reg:g}"
+            raw_alphas[score_type][key] = metrics.pop("alpha_values")
+            absolute_gain = baseline["average_set_size"] - metrics["average_set_size"]
+            relative_gain = absolute_gain / baseline["average_set_size"]
+            policies[key] = {
+                **metrics,
+                "absolute_efficiency_gain": absolute_gain,
+                "relative_efficiency_gain": relative_gain,
+                "post_hoc_consistent": metrics["post_hoc_ratio"] <= 1.0,
+                "policy_seed": policy_seed,
+            }
+        run["scores"][score_type] = {
+            "score_properties": properties,
+            "baseline": baseline,
+            "policies": policies,
+        }
+    return run, raw_alphas
+
+
+def _write_extension_analysis(summary, config, output_path):
+    checks = summary["research_checks"]
+    lines = [
+        "# Conformity-Score Extension Study",
+        "",
+        "## Configuration",
+        "",
+        f"Seeds: `{config['seeds']}`; lambdas: `{config['lambdas']}`; "
+        f"fixed baseline alpha: `{config['fixed_alpha']}`.",
+        "",
+        "## Efficiency summary",
+        "",
+        "| Score | Lambda | ACP mean size | Fixed mean size | Absolute gain | Relative gain | Post-hoc valid for all seeds |",
+        "|---|---:|---:|---:|---:|---:|:---:|",
+    ]
+    for score_type in SCORE_TYPES:
+        baseline_size = summary[score_type]["baseline"]["average_set_size"]["mean"]
+        for lambda_reg in config["lambdas"]:
+            metrics = summary[score_type]["lambdas"][f"{lambda_reg:g}"]
+            lines.append(
+                f"| {score_type} | {lambda_reg:g} | "
+                f"{metrics['average_set_size']['mean']:.4f} ± {metrics['average_set_size']['std']:.4f} | "
+                f"{baseline_size:.4f} | {metrics['absolute_efficiency_gain']['mean']:.4f} | "
+                f"{100 * metrics['relative_efficiency_gain']['mean']:.2f}% | "
+                f"{'yes' if metrics['post_hoc_consistent_all_seeds'] else 'no'} |"
+            )
+    best = checks["largest_valid_efficiency_gain"]
+    best_text = (
+        "No score/lambda combination satisfied the empirical post-hoc check for all seeds."
+        if best is None
+        else (
+            f"The largest valid mean relative gain was produced by `{best['score_type']}` "
+            f"at lambda `{best['lambda']:g}`: {100 * best['relative_gain']:.2f}% "
+            f"({best['absolute_gain']:.4f} labels)."
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## Research questions",
+            "",
+            "1. **Does ACP consistently reduce set size?** "
+            + (
+                "Yes, for every score/lambda pair and every seed."
+                if checks["reduction_consistent_for_both_scores"]
+                else "Not universally; consult the table and per-seed JSON for exceptions."
+            ),
+            "2. **Are adaptive-alpha distributions similar?** The maximum matched-quantile gaps by lambda are "
+            f"`{checks['maximum_alpha_quantile_gap_by_lambda']}`; interpret these with the distribution plot.",
+            f"3. **Which score has the largest efficiency gain?** {best_text}",
+            "4. **Are the conclusions score-robust?** Treat them as robust only where the direction of the efficiency effect and the post-hoc check agree across both scores and all seeds.",
+            "5. **What score properties matter?** Non-negativity and negative orientation are required. Score scale, probability-mass concentration, and smoothness also matter in practice: cross-entropy is smooth and unbounded, while APS is bounded and rank-adaptive but piecewise smooth because its ordering changes at probability ties.",
+            "",
+            "The post-hoc statistic is an empirical estimate; a value above one in a finite run is reported as a failed diagnostic, not as a proof that the theorem is false.",
+        ]
+    )
+    Path(output_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_score_extension_colab(
+    *,
+    seeds=(42, 43, 44),
+    lambdas=(5.0, 10.0, 50.0),
+    fixed_alpha=0.1,
+    classifier_epochs=5,
+    policy_epochs=2000,
+    batch_size=64,
+    policy_lr=1e-3,
+    k=100.0,
+    output_dir="score_extension_outputs",
+):
+    """Run the paired cross-entropy/APS extension study in Colab."""
+    if not seeds or not lambdas:
+        raise ValueError("seeds and lambdas must be non-empty")
+    if not 0 < fixed_alpha < 1:
+        raise ValueError("fixed_alpha must be in (0, 1)")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+    if device.type != "cuda":
+        print("Warning: enable a GPU via Runtime > Change runtime type.")
+    runs = []
+    raw_by_seed = {}
+    combined_alphas = {
+        score_type: {f"{lambda_reg:g}": [] for lambda_reg in lambdas}
+        for score_type in SCORE_TYPES
+    }
+    for seed in seeds:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        trainloader, calloader, testloader = load_data(batch_size=batch_size)
+        model = MLP().to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+        print(f"\nTraining classifier for seed {seed}...")
+        test_loss = None
+        test_accuracy = None
+        for epoch in range(classifier_epochs):
+            train_loss = train_classifier_epoch(
+                model, trainloader, criterion, optimizer, device
+            )
+            test_loss, test_accuracy = evaluate_classifier(
+                model, testloader, criterion, device
+            )
+            print(
+                f"classifier epoch {epoch + 1}: train_loss={train_loss:.4f}, "
+                f"test_loss={test_loss:.4f}, test_accuracy={test_accuracy:.4f}"
+            )
+        run, raw_alphas = _run_extension_for_model(
+            model,
+            calloader,
+            testloader,
+            device,
+            seed=seed,
+            lambdas=lambdas,
+            fixed_alpha=fixed_alpha,
+            policy_epochs=policy_epochs,
+            policy_lr=policy_lr,
+            k=k,
+            policy_batch_size=batch_size,
+        )
+        run["classifier"] = {
+            "test_loss": test_loss,
+            "test_accuracy": test_accuracy,
+        }
+        runs.append(run)
+        raw_by_seed[str(seed)] = raw_alphas
+        for score_type in SCORE_TYPES:
+            for lambda_reg in lambdas:
+                key = f"{lambda_reg:g}"
+                combined_alphas[score_type][key].extend(raw_alphas[score_type][key])
+
+    config = {
+        "seeds": list(seeds),
+        "lambdas": list(lambdas),
+        "fixed_alpha": fixed_alpha,
+        "classifier_epochs": classifier_epochs,
+        "policy_epochs": policy_epochs,
+        "batch_size": batch_size,
+        "policy_lr": policy_lr,
+        "k": k,
+    }
+    summary = _aggregate_extension_runs(runs, lambdas)
+    results = {"config": config, "runs": runs, "summary": summary}
+    results_path = output_dir / "score_extension_results.json"
+    raw_path = output_dir / "score_extension_alphas.pt"
+    efficiency_path = output_dir / "score_extension_efficiency.png"
+    alpha_path = output_dir / "score_extension_alpha_distributions.png"
+    analysis_path = output_dir / "SCORE_EXTENSION_ANALYSIS.md"
+    results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    torch.save(raw_by_seed, raw_path)
+    _plot_extension_efficiency(summary, lambdas, efficiency_path)
+    _plot_extension_alpha_distributions(combined_alphas, lambdas, alpha_path)
+    _write_extension_analysis(summary, config, analysis_path)
+    paths = {
+        "results": str(results_path),
+        "raw_alphas": str(raw_path),
+        "efficiency_plot": str(efficiency_path),
+        "alpha_distribution_plot": str(alpha_path),
+        "analysis": str(analysis_path),
+    }
+    print("\nExtension-study outputs:")
+    for name, path in paths.items():
+        print(f"  {name}: {path}")
+    try:
+        from IPython.display import Image, display
+
+        display(Image(filename=str(efficiency_path)))
+        display(Image(filename=str(alpha_path)))
+    except ImportError:
+        pass
+    return {"results": results, "raw_alphas": raw_by_seed, "paths": paths}
 
 
 def _sample_test_loader(testloader, sample_size=100, seed=42):
@@ -653,6 +1320,7 @@ def reproduce_figure_four(
     test_seed=42,
     output_path="figure_4_reproduction.png",
     results_path=None,
+    score_type="cross_entropy",
 ):
     """Reproduce Figure 4 using the paper's Algorithm 2 settings."""
     selected_lambda, policy, loo_size, history = select_lambda(
@@ -668,13 +1336,22 @@ def reproduce_figure_four(
         k=k,
         batch_size=policy_batch_size,
         return_history=True,
+        score_type=score_type,
     )
-    total_score, n = get_cal_total_score(model, calloader, device)
+    total_score, n = get_cal_total_score(
+        model, calloader, device, score_type
+    )
     sampled_testloader = _sample_test_loader(
         testloader, sample_size=test_sample_size, seed=test_seed
     )
     test_metrics = evaluate_policy(
-        model, policy, sampled_testloader, total_score, n, device
+        model,
+        policy,
+        sampled_testloader,
+        total_score,
+        n,
+        device,
+        score_type,
     )
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -692,6 +1369,7 @@ def reproduce_figure_four(
                 "target_size": target_size,
                 "tolerance": tolerance,
                 "initial_lambda": initial_lambda,
+                "score_type": score_type,
                 "selected_lambda": selected_lambda,
                 "loo_size": loo_size,
                 "test_sample_size": test_sample_size,
@@ -744,6 +1422,7 @@ def verify_acp(
     k=100.0,
     batch_size=64,
     variation_tolerance=1e-3,
+    score_type="cross_entropy",
 ):
     """Run all three pre-experiment checks requested in Part 3."""
     if len(lambdas) < 2:
@@ -751,7 +1430,9 @@ def verify_acp(
     if variation_tolerance <= 0:
         raise ValueError("variation_tolerance must be positive")
 
-    cal_logits, cal_scores = _calibration_outputs(model, calloader, device)
+    cal_logits, cal_scores = _calibration_outputs(
+        model, calloader, device, score_type
+    )
     reports = {}
     print("\n" + "=" * 60)
     print("ACP verification across lambda values")
@@ -767,9 +1448,16 @@ def verify_acp(
             lr=lr,
             k=k,
             batch_size=batch_size,
+            score_type=score_type,
         )
         metrics = evaluate_policy(
-            model, policy, testloader, total_score, n, device
+            model,
+            policy,
+            testloader,
+            total_score,
+            n,
+            device,
+            score_type,
         )
         nontrivial = _has_nontrivial_alpha_variation(
             metrics, variation_tolerance
@@ -1007,3 +1695,6 @@ def run_figure_four_colab(
 #
 # Figure 4 reproduction:
 # figure_four_results = run_figure_four_colab()
+#
+# Part 6 conformity-score extension study:
+# extension_results = run_score_extension_colab()
